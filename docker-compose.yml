@@ -1,0 +1,70 @@
+# Local run: `docker compose up --build`, then open http://localhost:8000
+# Works without any .env file: every variable has a local default below.
+# For a server, copy .env.example to .env and set real passwords.
+
+x-postgres-env: &postgres-env
+  POSTGRES_DB: ${POSTGRES_DB:-incidents}
+  POSTGRES_USER: ${POSTGRES_USER:-incidents}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-local-dev-only-postgres}
+
+services:
+  app:
+    build: .
+    image: incident-desk:local
+    environment:
+      <<: *postgres-env
+      POSTGRES_HOST: postgres
+      REDIS_HOST: redis
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-local-dev-only-redis}
+      RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-5}
+    ports:
+      # Only the application is published. The databases are reachable
+      # from inside the Compose network only.
+      - "${APP_BIND:-127.0.0.1}:${APP_PORT:-8000}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      <<: *postgres-env
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.4-alpine
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-local-dev-only-redis}
+      # Lets redis-cli inside the container authenticate without typing the password.
+      REDISCLI_AUTH: ${REDIS_PASSWORD:-local-dev-only-redis}
+    # AOF: every write is appended to a log on disk, flushed every second.
+    command: ["sh", "-c", "exec redis-server --appendonly yes --appendfsync everysec --requirepass \"$$REDIS_PASSWORD\""]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  redis-data:
