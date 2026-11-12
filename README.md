@@ -1,88 +1,142 @@
-# compose-to-k8s
+# Incident Desk
 
-An incident reporting portal, similar to an IT helpdesk ticket form, built
-with FastAPI, PostgreSQL and Redis. The project starts as a Docker Compose
-application and grows into a deployment on a hardened VPS with k3s, GitOps
-(Argo CD) and HTTPS: a hands-on DevSecOps learning project.
+A security incident reporting portal, like an IT service desk form: employees
+report a phishing email, a lost laptop or a suspicious login, and the IT team
+watches a live dashboard.
 
-## Project status
+![Live dashboard](docs/screenshot.png)
 
-- [x] Repository setup, branch protection, architecture decisions
-- [ ] Application: form, report list, PostgreSQL, Redis, rate limiting
-- [ ] Docker Compose: one-command local run
-- [ ] Continuous integration: tests, image build, vulnerability scan
-- [ ] Hardened VPS
-- [ ] Kubernetes (k3s)
-- [ ] GitOps: Argo CD and Sealed Secrets
-- [ ] Public exposure with HTTPS
-- [ ] Kubernetes and application hardening
+Built for the NoSQL course at ENSIIE: **one web application, two databases
+with distinct roles, orchestrated with Docker Compose and deployed on a VPS.**
 
-## Getting started
-
-Requirements: Git and Docker with Compose.
-
-    git clone https://github.com/HakeemMHB/compose-to-k8s.git
-    cd compose-to-k8s
-    docker compose up
-
-Then open http://localhost:8000. No configuration file is needed for a
-local run.
-
-The commands to inspect the data in each database will be described in
-`docs/demo.md`.
-
-## Stack
-
-| Layer | Tools |
+| | |
 |---|---|
-| Application | Python, FastAPI, Jinja2, Pydantic |
-| Data | PostgreSQL, Redis |
-| Containers | Docker, Docker Compose |
-| Continuous integration | GitHub Actions, Trivy, GitHub Container Registry (GHCR) |
-| Deployment | VPS, k3s, Kustomize |
-| Continuous deployment | Argo CD, Sealed Secrets |
-| Exposure | Traefik, cert-manager, Let's Encrypt |
+| Application | Python 3.12, FastAPI, Jinja2, Pydantic |
+| Data | PostgreSQL 17 (source of truth), Redis 7.4 (cache, rate limiting, live feed) |
+| Delivery | Docker Compose, GitHub Actions, Ubuntu VPS (OVHcloud) |
+
+## Quick start
+
+Requirements: Git and Docker with Compose. No configuration file needed.
+
+```bash
+git clone https://github.com/HakeemMHB/incident-desk.git
+cd incident-desk
+docker compose up --build
+```
+
+Open http://localhost:8000. To look inside each database, follow
+[docs/demo.md](docs/demo.md).
+
+## Features
+
+- **Report form** with server-side validation and a clear message per field.
+- **Live dashboard**: new reports appear instantly in every open window
+  (Redis Pub/Sub + Server-Sent Events), with counters per severity and a
+  breakdown per category.
+- **Rate limiting** per IP address, stored in Redis: 5 reports per minute by
+  default, then HTTP 429.
+- **Resilience**: if Redis goes down, reports are still saved and the
+  dashboard reads PostgreSQL. If Redis loses its data, it is rebuilt from
+  PostgreSQL automatically.
+- **Security by default**: parameterized SQL, auto-escaped templates,
+  Content-Security-Policy, non-root read-only container, databases not
+  exposed, no secret in Git.
 
 ## Why two databases
 
-- **PostgreSQL is the source of truth.** Every report is stored in full and
-  durably, in a table whose schema enforces the expected structure.
-- **Redis is the fast layer.** It holds the latest reports, counters per
-  severity and per-IP rate limiting. Atomic counters (`INCR`) and automatic
-  expiry (`EXPIRE`) make rate limiting simple, with no cleanup job.
+| | PostgreSQL | Redis |
+|---|---|---|
+| Role | Source of truth: every report, in full | Fast layer: derived and short-lived data |
+| Data | `reports` table, with CHECK constraints | Capped list of recent reports, severity counters, rate-limit counters, live channel |
+| If lost | Data is lost: it is backed by a volume | Rebuilt from PostgreSQL |
 
-MongoDB and Neo4j were considered and rejected: reports share a fixed
-structure and have no relationships between them. See
-[ADR 001](docs/adr/001-use-postgresql-and-redis-for-data-storage.md).
+MongoDB and Neo4j were considered and rejected: reports all share one fixed
+structure and have no relationships between them. See the
+[architecture decision records](docs/adr/).
 
-## Security by layer
+## Design questions
 
-| Layer | Measures |
-|---|---|
-| Server | SSH by key only, password and root login disabled, minimal firewall, fail2ban, automatic security updates |
-| Cluster | Default-deny NetworkPolicies, Pod Security `restricted`, encrypted secrets in Git |
-| Application | Input validation, per-IP rate limiting, output escaping, parameterized SQL queries, security headers |
+**Why pull requests on a solo project?** `main` always works, so anyone can
+clone it at any time; the CI runs on the pull request before the change
+reaches `main`; and every change keeps its *what* and *why* in the pull
+request, linked from the commit.
 
-## Delivery workflow
+**Why is Redis suited to rate limiting, and PostgreSQL not?** `INCR` is
+atomic, so two simultaneous requests cannot both read the same old value, and
+`EXPIRE` makes Redis delete the counter itself at the end of the window. With
+PostgreSQL, every request would be a disk write, and old rows would need a
+cleanup job.
 
-- **Continuous integration:** every pull request runs linting and tests. On
-  `main`, the image is built, scanned with Trivy and published to GHCR.
-- **Continuous deployment:** Argo CD watches the repository and applies every
-  change merged on `main` to the cluster. Nobody changes the server by hand.
+**If Redis goes down, should submissions be refused?** No: a lost security
+report costs more than a few unthrottled requests. Reports are still saved in
+PostgreSQL and the outage is logged. See
+[ADR 003](docs/adr/003-keep-working-when-redis-is-down.md).
 
-### Why pull requests on a solo project
+**How is SQL injection prevented?** Values are never inserted into the SQL
+text: they travel separately as parameters (`%(title)s` in
+[`app/db/postgres.py`](app/db/postgres.py)). A test stores
+`x'); DROP TABLE reports; --` and checks it comes back as plain text.
 
-- `main` always works: anyone can clone the project at any time.
-- Tests run on the pull request, before the change reaches `main`.
-- Reviewing the full diff before merging catches mistakes.
-- Each change keeps its *what* and *why* in the pull request description,
-  linked from the commit on `main`.
+**Why separate `/healthz` and `/readyz`?** `/healthz` says the process is
+alive and never touches the databases: restarting the app would not fix a
+database outage. `/readyz` says both databases answer, and names the one that
+does not.
+
+**Named volume or bind mount?** A named volume is managed by Docker and
+independent of the host's folder layout; a bind mount maps a host folder. The
+databases use named volumes, so the data survives `docker compose down`
+(but not `down -v`).
+
+**Why not run as root in the container?** If the application is compromised,
+the attacker gets an unprivileged user in a read-only file system with no
+Linux capabilities, instead of root.
+
+**How does Redis persist its data?** With AOF (`appendonly yes`): every write
+is appended to a log, flushed to disk every second, so a crash loses at most
+about one second of writes. RDB snapshots alone could lose everything since
+the last snapshot.
+
+**Why `postgres:17-alpine` and not `latest`?** `latest` changes without
+notice: a new major version could refuse the existing data files. A fixed
+version gives the same result on every machine.
+
+**Why an SSH key rather than a password?** A key cannot be guessed by brute
+force, and the private part never leaves your machine. Password login is
+disabled on the server, so bots trying passwords get nowhere.
+
+## Tests
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements-dev.txt
+pytest
+```
+
+Unit tests use in-memory fakes and need no database. Integration tests run
+against real databases when `INTEGRATION_TESTS=1` is set. The CI runs both,
+then starts the full stack with Docker Compose and checks that data reaches
+both databases and survives a restart.
 
 ## Documentation
 
-- [Architecture decisions](docs/adr/)
-- Architecture overview, demo procedure and troubleshooting journal: coming
-  with the next steps
+- [Architecture](docs/architecture.md): diagram, path of a submission, Redis keys
+- [Demo procedure](docs/demo.md): the exact commands for each database
+- [Deployment on a VPS](docs/deploy.md): server hardening and production setup
+- [Architecture decision records](docs/adr/)
+
+## How this project was built
+
+Time-boxed, AI-assisted build. I set up the repository, the branch
+protection and the pull request workflow, and made the architecture
+decisions (ADRs 001 and 002) before any code was written. The implementation
+was then generated with Claude (Anthropic) in a two-hour sprint, under my
+direction. I reviewed it, ran the tests, deployed it and can explain every
+choice above.
+
+What this shows: delivering a working, tested and documented application
+under a hard deadline, with the decisions kept in my hands. What it does not
+show: writing every line myself. That is the goal of my next projects.
 
 ## License
 

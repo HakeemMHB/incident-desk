@@ -62,3 +62,4 @@ Chosen option: **PostgreSQL + Redis**.
   reports and counters are lost on restart.
 - **Open question:** whether submissions are accepted or rejected when Redis
   is unavailable will be decided while building the application.
+  Resolved by [ADR 003](003-keep-working-when-redis-is-down.md).
